@@ -194,6 +194,8 @@ class YoloDetector:
     def process_yolo_output(self, detections, scale, iou_threshold=0.45):
         '''
         Process YOLO output tensor into bounding boxes, scores, and class IDs
+        Supports both YOLOv5 format [batch, num_detections, 5+num_classes]
+        and YOLOv8 format [batch, 4+num_classes, num_detections]
         
         Parameters:
         - detections: output tensor from the model
@@ -210,21 +212,38 @@ class YoloDetector:
         
         if len(detections.shape) == 3:
             detections = detections[0]  # Take first batch
-        num_classes = detections.shape[1] - 5  # Subtract 5 for x,y,w,h,conf
-        confidence_scores = detections[:, 4]
+        
+        # Detect YOLOv8 vs YOLOv5 format based on shape
+        # YOLOv8: shape is [4+num_classes, num_detections] (e.g., [12, 8400] for 8 classes)
+        # YOLOv5: shape is [num_detections, 5+num_classes] (e.g., [8400, 13] for 8 classes)
+        is_yolov8_format = detections.shape[0] < detections.shape[1]
+        
+        if is_yolov8_format:
+            # YOLOv8 format: transpose to [num_detections, 4+num_classes]
+            detections = detections.T
+            num_classes = detections.shape[1] - 4  # YOLOv8 has no separate conf score
+            
+            # For YOLOv8, confidence is the max class score
+            class_scores_all = detections[:, 4:4+num_classes]
+            confidence_scores = np.max(class_scores_all, axis=1)
+        else:
+            # YOLOv5 format: [num_detections, 5+num_classes]
+            num_classes = detections.shape[1] - 5  # Subtract 5 for x,y,w,h,conf
+            confidence_scores = detections[:, 4]
         
         mask = confidence_scores >= self.conf_threshold
         if not np.any(mask):
             return [], [], []
         
         filtered_detections = detections[mask]
+        filtered_confidence = confidence_scores[mask]
         
         # Extract boxes, scores, and class IDs
         boxes = []
         scores = []
         class_ids = []
         
-        for detection in filtered_detections:
+        for i, detection in enumerate(filtered_detections):
             # Get box coordinates
             x, y, w, h = detection[0:4]
             
@@ -234,22 +253,24 @@ class YoloDetector:
             x2 = (x + w/2) * width_scale
             y2 = (y + h/2) * height_scale
             
-            # Get confidence score
-            conf = detection[4]
-            
-            # Get class scores and ID
-            if num_classes == 1:
-                # If only one class, the class id is always 0
-                class_id = 0
-                class_score = 1.0
-            else:
-                # Get class with highest probability
-                class_scores = detection[5:5+num_classes]
+            if is_yolov8_format:
+                # YOLOv8: class scores start at index 4
+                class_scores = detection[4:4+num_classes]
                 class_id = np.argmax(class_scores)
-                class_score = class_scores[class_id]
-            
-            # Final score is confidence * class probability
-            score = float(conf * class_score)
+                score = float(class_scores[class_id])
+            else:
+                # YOLOv5: get confidence and class scores
+                conf = detection[4]
+                
+                if num_classes == 1:
+                    class_id = 0
+                    class_score = 1.0
+                else:
+                    class_scores = detection[5:5+num_classes]
+                    class_id = np.argmax(class_scores)
+                    class_score = class_scores[class_id]
+                
+                score = float(conf * class_score)
             
             if score >= self.conf_threshold:
                 boxes.append([x1, y1, x2, y2])
@@ -288,8 +309,11 @@ class YoloDetector:
             class_name = f"unknown_{class_id}"
         
         label = f'{class_name}: {confidence:.2f}'
+        
+        # Safely get color - wrap around if class_id exceeds available colors
+        color = self.colors[class_id % len(self.colors)]
 
-        cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), self.colors[class_id], 4)
+        cv2.rectangle(img, (x, y), (x_plus_w, y_plus_h), color, 4)
         
         # Text specifications
         font = cv2.FONT_HERSHEY_DUPLEX 
